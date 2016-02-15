@@ -1,14 +1,14 @@
-//===----------------------------------------------------------------------===//
-//
-//                         PelotonDB
-//
-// hash_join_executor.cpp
-//
-// Identification: src/backend/executor/hash_join_executor.cpp
-//
-// Copyright (c) 2015, Carnegie Mellon University Database Group
-//
-//===----------------------------------------------------------------------===//
+/*-------------------------------------------------------------------------
+ *
+ * hash_join.cpp
+ * file description
+ *
+ * Copyright(c) 2015, CMU
+ *
+ * /peloton/src/executor/hash_join_executor.cpp
+ *
+ *-------------------------------------------------------------------------
+ */
 
 #include <vector>
 
@@ -32,14 +32,10 @@ HashJoinExecutor::HashJoinExecutor(const planner::AbstractPlan *node,
 
 bool HashJoinExecutor::DInit() {
   assert(children_.size() == 2);
-
   auto status = AbstractJoinExecutor::DInit();
   if (status == false) return status;
-
   assert(children_[1]->GetRawNode()->GetPlanNodeType() == PLAN_NODE_TYPE_HASH);
-
   hash_executor_ = reinterpret_cast<HashExecutor *>(children_[1]);
-
   return true;
 }
 
@@ -49,37 +45,77 @@ bool HashJoinExecutor::DInit() {
  * @return true on success, false otherwise.
  */
 bool HashJoinExecutor::DExecute() {
-  // Loop until we have non-empty result join logical tile or exit
+  // build hash map for right table
+  if (!right_child_done_) {
+    while (hash_executor_->Execute() == true)
+      BufferRightTile(children_[1]->GetOutput());
+    right_child_done_ = true;
+  }
 
-  // Build outer join output when done
+  for (;;) {
+    // left child & right child all done
+    if (left_child_done_ && right_child_done_) {
+      return BuildOuterJoinOutput();
+    }
 
-  //===--------------------------------------------------------------------===//
-  // Pick right and left tiles
-  //===--------------------------------------------------------------------===//
+    // if there is remaining pairs in buffer, release one at a time.
+    if (!buffered_output_tiles.empty()) {
+      // just hand in one.
+      SetOutput(buffered_output_tiles.front());
+      buffered_output_tiles.pop_front();
+      return true;
+    }
 
-  // Get all the logical tiles from RIGHT child
+    // traverse every left child tile
+    if (children_[0]->Execute()) {
+      BufferLeftTile(children_[0]->GetOutput());
+      LogicalTile *left_tile = left_result_tiles_.back().get();
 
-  // Get next logical tile from LEFT child
+      // traverse every tuple in curt left tile
+      for (auto left_tile_row_itr : *left_tile) {
+        auto hash = HashExecutor::HashMapType::key_type(
+            left_tile, left_tile_row_itr, &hash_executor_->GetHashKeyIds());
+        auto hash_result = hash_executor_->GetHashTable().find(hash);
+        if (hash_result != hash_executor_->GetHashTable().end()) {
+          RecordMatchedLeftRow(left_logical_tile_itr_, left_tile_row_itr);
+          // traverse right set
+          for (auto iter = hash_result->second.begin();
+               iter != hash_result->second.end(); ++iter) {
+            auto tile_index = iter->first;
+            auto tuple_index = iter->second;
+            RecordMatchedRightRow(tile_index, tuple_index);
+            LogicalTile *right_tile = right_result_tiles_[tile_index].get();
+            LogicalTile::PositionListsBuilder pos_lists_builder(left_tile,
+                                                                right_tile);
+            pos_lists_builder.AddRow(left_tile_row_itr, tuple_index);
+            auto output_tile = BuildOutputLogicalTile(left_tile, right_tile);
+            output_tile->SetPositionListsAndVisibility(
+                pos_lists_builder.Release());
+            buffered_output_tiles.emplace_back(output_tile.release());
+          }  // end of traversing right set
+        }    // end of if match
+      }      // end of traversal of curt left_tile
 
-  //===--------------------------------------------------------------------===//
-  // Build Join Tile
-  //===--------------------------------------------------------------------===//
+      // Release at most one pair.
+      // PS: This should be done after traversing all the tuples in curt tile
+      left_logical_tile_itr_++;
+      if (!buffered_output_tiles.empty()) {
+        // release one at a time
+        SetOutput(buffered_output_tiles.front());
+        buffered_output_tiles.pop_front();
+        return true;
+      }
+    }  // end of still have left tile
 
-  // Build output join logical tile
-
-  // Build position lists
-
-  // Get the hash table from the hash executor
-
-  // Go over the left logical tile
-  // For each tuple, find matching tuples in the hash table built on top of the
-  // right table
-  // Go over the matching right tuples
-
-  // Check if we have any join tuples
-
+    // All left tiles are exhausted.
+    else {
+      left_child_done_ = true;
+      return BuildOuterJoinOutput();
+    }
+  }  // end of infinite loop
+  // never should go here
   return false;
-}
-
+}  // end of DExecute
 }  // namespace executor
 }  // namespace peloton
+
